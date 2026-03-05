@@ -108,7 +108,7 @@
  * @param v Vector pointer
  * @return Pointer to vec_metadata structure
  */
-#define VEC_METADATA(v) ((vec_metadata *)((u8 *)(v) - sizeof(vec_metadata)))
+#define VEC_METADATA(v) ((vec_metadata *)((char *)(v) - sizeof(vec_metadata)))
 
 /**
  * @internal
