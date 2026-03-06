@@ -37,7 +37,7 @@
 #define RULE_UNARY_MASK (1 << 9)
 #define RULE_MULTI_MASK (1 << 10)
 
-#define print(x) _Generic((x),																	\
+#define print(x) _Generic((x),																		\
 	token *: printTok,																							\
 	rule *: printRule																								\
 )(x)
@@ -64,16 +64,15 @@ typedef struct {
 } token;
 
 typedef enum {
+	RULE_DEFINITION,
 	RULE_TERM					= RULE_TERM_MASK,
 	RULE_REFERENCE,
 
-	RULE_GROUP 				= RULE_UNARY_MASK,
-	RULE_OPTIONAL,
+	RULE_OPTIONAL			= RULE_UNARY_MASK,
 	RULE_REPETITION,
 
 	RULE_SEQUENCE 		= RULE_MULTI_MASK,
 	RULE_ALTERNATIVE,
-	RULE_DEFINITION
 } ruletype;
 
 typedef struct rule {
@@ -89,7 +88,7 @@ typedef struct {
 	token 	**iter;
 	size_t 	current;
 
-	/* A list of RULE_DEFINITION*/
+	/* A list of RULE_DEFINITION */
 	rule  	**rules;
 } context;
 
@@ -188,6 +187,8 @@ int scan(context *ctx, char **src) {
 				tok = maketok(TOK_RPAREN, NULL);
 			} else if (**src == '[') {
 				tok = maketok(TOK_LSPAREN, NULL);
+			} else if (**src == ']') {
+				tok = maketok(TOK_RSPAREN, NULL);
 			} else if (**src == '{') {
 				tok = maketok(TOK_LBRACKET, NULL);
 			} else if (**src == '}') {
@@ -225,19 +226,6 @@ token *consume(context *ctx) {
 	return tok;
 }
 
-rule *parseSeq(context *);
-
-rule *parseOr(context *ctx) {
-	rule **children = NULL;
-	rule *pattern = NULL;
-
-	while (( pattern = parseSeq(ctx) )) {
-		vecpush(children, pattern);
-		if (!match(ctx, TOK_PIPE)) break;
-	}
-	return NULL;
-}
-
 rule *parseSeq(context *ctx) {
 	rule **children = NULL;
 	rule *current = NULL;
@@ -245,14 +233,39 @@ rule *parseSeq(context *ctx) {
 	while (( current = parsePattern(ctx) )) {
 		vecpush(children, current);
 	}
+
+	if (veclen(children) == 1) {
+		current = children[0];
+		vecfree(children);
+		return current;
+	}
+
 	return makemulti(RULE_SEQUENCE, children);
+}
+
+rule *parseOr(context *ctx) {
+	rule **children = NULL;
+	rule *pattern = parseSeq(ctx);
+
+	if (!pattern) return NULL;
+	if (!check(ctx, TOK_PIPE)) return pattern;
+
+	while (match(ctx, TOK_PIPE)) {
+		pattern = parseSeq(ctx);
+		if (!pattern) {
+			return NULL;
+		}
+		vecpush(children, pattern);
+	}
+
+	return makemulti(RULE_ALTERNATIVE, children);
 }
 
 rule *parseWrapped(context *ctx, toktype left, toktype right) {
 	if (!match(ctx, left)) {
 		return NULL;
 	}
-	rule *pattern = parsePattern(ctx);
+	rule *pattern = parseOr(ctx);
 	if (!pattern) return NULL;
 	if (!match(ctx, right)) {
 		return NULL;
@@ -319,7 +332,7 @@ rule *parseRuleDecl(context *ctx) {
 		return NULL;
 	}
 
-	rule *pattern = parsePattern(ctx);
+	rule *pattern = parseOr(ctx);
 
 	if (!pattern) {
 		return NULL;
@@ -365,30 +378,42 @@ void printRuleWithIndent(rule *r, int depth) {
 	for (int i = 0; i < depth; i++) printf("  ");
 
 	depth++;
-	if (r->type == RULE_DEFINITION) {
-		print(r->children[0]->tok);
-		printf(" = \n");
+	
+	switch (r->type) {
+	case RULE_ALTERNATIVE:
+		printf("or:\n");
+		break;
+	case RULE_DEFINITION:
+		printf("rule[%s]:\n", r->children[0]->tok->lexeme);
 		printRuleWithIndent(r->children[1], depth);
-		return;
+		break;
+	case RULE_OPTIONAL:
+		printf("optional:\n");
+		break;
+	case RULE_REFERENCE:
+		break;
+	case RULE_REPETITION:
+		printf("repetition:\n");
+		break;
+	case RULE_SEQUENCE:
+		printf("sequence:\n");
+		break;
+	default: break;
 	}
 	if (r->type & RULE_TERM_MASK) {
 		print(r->tok);
 		printf("\n");
-		return;
-	} 
-	
-
-	if (r->type & RULE_UNARY_MASK) {
+	} else if (r->type & RULE_UNARY_MASK) {
 		printRuleWithIndent(r->child, depth);
 	} else if (r->type & RULE_MULTI_MASK) {
 		for (size_t i = 0; i < veclen(r->children); i++) {
 			printRuleWithIndent(r->children[i], depth);
 		}
 	}
-	printf("\n");
 }
 
 void printRule(rule *r) { printRuleWithIndent(r, 0); }
+
 
 void repl(context *ctx) {
 	while (1) {
@@ -403,15 +428,13 @@ void repl(context *ctx) {
 		} else if (strcmp(line, "clear") == 0) {
 			printf("\033[2J\033[0H");
 			continue;
+		} else if (strcmp(line, "exec ") == 0) {
+			
 		}
 
 		scan(ctx, &line);
 
 		parse(ctx);
-
-		for (size_t i = 0; i < veclen(ctx->rules); i++) {
-			print(ctx->rules[i]);
-		}
 	}
 }
 
