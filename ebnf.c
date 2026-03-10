@@ -32,6 +32,7 @@
 #include <stddef.h>
 
 #include "zvec.h"
+#include "trie.h"
 
 #define RULE_TERM_MASK	(1 << 8)
 #define RULE_UNARY_MASK (1 << 9)
@@ -64,37 +65,48 @@ typedef struct {
 } token;
 
 typedef enum {
-	RULE_DEFINITION,
 	RULE_TERM					= RULE_TERM_MASK,
 	RULE_REFERENCE,
 
 	RULE_OPTIONAL			= RULE_UNARY_MASK,
+	RULE_DEFINITION,
 	RULE_REPETITION,
 
 	RULE_SEQUENCE 		= RULE_MULTI_MASK,
 	RULE_ALTERNATIVE,
+	RULE_NAMED
 } ruletype;
 
 typedef struct rule {
-	ruletype type;
+	ruletype 					type;
+	token 						*name;
 	union {
-		token 			*tok;
-		struct rule *child;
-		struct rule **children;
+		token 					*tok;
+		struct rule 		*child;
+		struct rule 		**children;
 	};
 } rule;
 
 typedef struct {
-	token 	**iter;
-	size_t 	current;
-
+	token 						**iter;
+	size_t 						current;
 	/* A list of RULE_DEFINITION */
-	rule  	**rules;
+	rule  						**rules;
+	trie 							*literals;
+	int 							ruleMode;
+	char							*mainRule;
 } context;
 
 void printRule(rule *);
 void printTok(token *);
 rule *parsePattern(context *);
+
+context *makecontext() {
+	context *ctx = calloc(1, sizeof(context));
+	ctx->literals = maketrie();
+	ctx->mainRule = "main";
+	return ctx;
+}
 
 token *maketok(toktype type, char *lexeme) {
 	token *self = calloc(1, sizeof(token));
@@ -103,6 +115,20 @@ token *maketok(toktype type, char *lexeme) {
 		.lexeme = lexeme
 	};
 	return self;
+}
+
+void freetok(token *tok) {
+	if (!tok) return;
+	if (tok->lexeme) free(tok->lexeme);
+	free(tok);
+}
+
+void freetokens(context *ctx) {
+	for (size_t i = 0; i < veclen(ctx->iter); i++) {
+		freetok(ctx->iter[i]);
+	}
+	if (ctx->iter) vecsetlen(ctx->iter, 0);
+	ctx->current = 0;
 }
 
 rule *makerule(ruletype type) {
@@ -127,6 +153,18 @@ rule *makemulti(ruletype type, rule **children) {
 	rule *self = makerule(type);
 	self->children = children;
 	return self;
+}
+
+void freerule(rule *r) {
+	if (!r) return;
+	if (r->type & RULE_UNARY_MASK) {
+		freerule(r->child);
+	} else if (r->type & RULE_MULTI_MASK) {
+		for (size_t i = 0; i < veclen(r->children); i++) {
+			freerule(r->children[i]);
+		}
+	}
+	free(r);
 }
 
 token *scanLiteral(context *ctx, char **src, char bound) {
@@ -204,7 +242,7 @@ int scan(context *ctx, char **src) {
 			vecpush(ctx->iter, tok);
 		}
 	}
-	return **src;
+	return 1;
 }
 
 int canPeek(context *ctx) { return ctx->current < veclen(ctx->iter); }
@@ -234,6 +272,8 @@ rule *parseSeq(context *ctx) {
 		vecpush(children, current);
 	}
 
+	if (!children) return NULL;
+
 	if (veclen(children) == 1) {
 		current = children[0];
 		vecfree(children);
@@ -250,6 +290,7 @@ rule *parseOr(context *ctx) {
 	if (!pattern) return NULL;
 	if (!check(ctx, TOK_PIPE)) return pattern;
 
+	vecpush(children, pattern);
 	while (match(ctx, TOK_PIPE)) {
 		pattern = parseSeq(ctx);
 		if (!pattern) {
@@ -297,6 +338,8 @@ rule *parseReference(context *ctx) {
 
 rule *parseTerm(context *ctx) {
 	if (!check(ctx, TOK_LIT)) return NULL;
+	char *lit = ctx->iter[ctx->current]->lexeme;
+	trieinsert(ctx->literals, lit);
 	return maketerm(RULE_TERM, consume(ctx));
 }
 
@@ -325,7 +368,7 @@ rule *parseRuleDecl(context *ctx) {
 		return NULL;
 	}
 
-	rule *name = maketerm(RULE_REFERENCE, consume(ctx));
+	token *name = consume(ctx);
 
 	if (!match(ctx, TOK_EQ)) {
 		printf("Expected '='");
@@ -338,24 +381,42 @@ rule *parseRuleDecl(context *ctx) {
 		return NULL;
 	}
 
-	rule **children = NULL;
-	vecpush(children, name);
-	vecpush(children, pattern);
-
-	return makemulti(RULE_DEFINITION, children);
+	rule *res = makeunary(RULE_DEFINITION, pattern);
+	res->name = name;
+	return res;
 }
 
-void parse(context *ctx) {
-	rule *r = NULL;
-	while (canPeek(ctx)) {
-		r = parseRuleDecl(ctx);
-		if (!r) {
-			print(ctx->iter[ctx->current]);
-			printf("\nInvalid expression\n");
-			return;
+rule *getRuleByName(context *ctx, token *name) {
+	for (size_t i = 0; i < veclen(ctx->rules); i++) {
+		if (strcmp(ctx->rules[i]->name->lexeme, name->lexeme) == 0) {
+			return ctx->rules[i];
 		}
-		print(r);
 	}
+	return NULL;
+}
+
+rule *upsertRule(context *ctx, rule *definition) {
+	rule *r = getRuleByName(ctx, definition->name);
+	if (!r) {
+		vecpush(ctx->rules, definition);
+		return definition;
+	}
+	freerule(r->child);
+	freetok(definition->name);
+	r->child = definition->child;
+	free(definition);
+	return r;
+}
+
+int parse(context *ctx) {
+	rule *r = parseRuleDecl(ctx);
+	if (!r) {
+		print(ctx->iter[ctx->current]);
+		printf("\nInvalid expression\n");
+		return 0;
+	}
+	print(upsertRule(ctx, r));
+	return 1;
 }
 
 void printTok(token *tok) {
@@ -384,8 +445,7 @@ void printRuleWithIndent(rule *r, int depth) {
 		printf("or:\n");
 		break;
 	case RULE_DEFINITION:
-		printf("rule[%s]:\n", r->children[0]->tok->lexeme);
-		printRuleWithIndent(r->children[1], depth);
+		printf("rule[%s]:\n", r->name->lexeme);
 		break;
 	case RULE_OPTIONAL:
 		printf("optional:\n");
@@ -414,6 +474,43 @@ void printRuleWithIndent(rule *r, int depth) {
 
 void printRule(rule *r) { printRuleWithIndent(r, 0); }
 
+token *nextInputToken(context *ctx, char **src) {
+	while (isspace(**src)) (*src)++;
+	if (!**src) return NULL;
+
+	if (isalpha(**src) || **src == '_') {
+		char *start = *src;
+
+		while (isalpha(**src) || **src == '_') (*src)++;
+		char *lexeme = strndup(start, *src - start);
+		return maketok(TOK_LIT, lexeme);
+	}
+	char *lexeme = trietok(ctx->literals, src);
+
+	if (lexeme) return maketok(TOK_LIT, lexeme);
+
+	(*src)++;
+	return NULL;
+}
+
+void scanInput(context *ctx, char **src) {
+	// freetokens(ctx);
+	token *cur = NULL;
+	char *start = *src;
+	while (**src) {
+		char *prev = *src;
+		cur = nextInputToken(ctx, src);
+		if (!cur) {
+			printf("Error scanning input text at %zu\n", prev - start);
+		} else {
+			vecpush(ctx->iter, cur);
+		}
+	}
+}
+
+rule *construct(context *ctx) {
+	return NULL;
+}
 
 void repl(context *ctx) {
 	while (1) {
@@ -428,18 +525,51 @@ void repl(context *ctx) {
 		} else if (strcmp(line, "clear") == 0) {
 			printf("\033[2J\033[0H");
 			continue;
-		} else if (strcmp(line, "exec ") == 0) {
-			
+		} else if (strcmp(line, "toggle") == 0) {
+			ctx->ruleMode = !ctx->ruleMode;
+			if (ctx->ruleMode) {
+				printf("Rule mode\n");
+			} else {
+				printf("Text mode\n");
+			}
+			continue;
+		} else if (strcmp(line, "ctx") == 0 ||
+								strcmp(line, "context") == 0) {
+			printf("Main rule: %s\n", ctx->mainRule);
+			printf("Mode: %s\n", ctx->ruleMode ? "Rule mode" : "Text mode");
+			printf("Rules: %zu\n", veclen(ctx->rules));
+			for (size_t i = 0; i < veclen(ctx->rules); i++) {
+				print(ctx->rules[i]);
+			}
+			continue;
+		} else if (strcmp(line, "set ") == 0) {
+			if (*(line + 4)) {
+				ctx->mainRule = line + 4;
+			}
+			continue;
 		}
 
-		scan(ctx, &line);
-
-		parse(ctx);
+		freetokens(ctx);
+		char *copy = line;
+		if (ctx->ruleMode) {
+			if (!scan(ctx, &line)) {
+				printf("Error scanning\n");
+				continue;
+			}
+			if (!parse(ctx)) {
+				printf("Error parsing\n");
+				continue;
+			}
+			add_history(copy);
+		} else {
+			scanInput(ctx, &line);
+			construct(ctx);
+		}
 	}
 }
 
-int main() {
-	context *ctx = calloc(1, sizeof(context));
+int main(int argc, char **argv) {
+	context *ctx = makecontext();
 
 	repl(ctx);
 
